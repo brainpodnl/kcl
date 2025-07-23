@@ -23,7 +23,7 @@ fn main() {
         .extern_path(".google.protobuf.Timestamp", "::prost_wkt_types::Timestamp")
         .extern_path(".google.protobuf.Value", "::prost_wkt_types::Value")
         .file_descriptor_set_path(&descriptor_file)
-        .compile_protos(&["../spec/gpyrpc/gpyrpc.proto"], &["../spec/gpyrpc/"])
+        .compile_protos(&["spec/gpyrpc/gpyrpc.proto"], &["spec/gpyrpc/"])
         .expect("Running prost build failed.");
 
     let descriptor_bytes = std::fs::read(descriptor_file).unwrap();
