@@ -41,7 +41,7 @@ kcl-tools = { path = "crates/tools" }
 kcl-utils = { path = "crates/utils" }
 kcl-version = { path = "crates/version" }
 
-serde_yaml = { path = "3rdparty/serde_yaml" }
+serde_yaml = { package = "kcl-serde-yaml", path = "3rdparty/serde_yaml" }
 
 [workspace.package]
 version = "0.13.2"
