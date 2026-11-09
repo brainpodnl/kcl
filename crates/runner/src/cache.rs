@@ -1,12 +1,7 @@
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::{Arc, Mutex, RwLock},
-    time::Instant,
-};
+use std::{collections::HashMap, path::PathBuf, sync::Mutex};
 
 use anyhow::{Result, anyhow};
-use kcl_ast::ast::{Module, Program};
+use kcl_ast::ast::Program;
 use kcl_parser::{KCLModuleCache, LoadProgramOptions, ParseSessionRef, load_program};
 
 #[derive(PartialEq)]
@@ -45,7 +40,7 @@ impl ProgramCache {
         &self,
         sess: ParseSessionRef,
         paths: &[&str],
-        opts: LoadProgramOptions,
+        mut opts: LoadProgramOptions,
     ) -> Result<Program> {
         let entries = kcl_parser::entry::get_compile_entries_from_paths(
             &paths
@@ -78,6 +73,7 @@ impl ProgramCache {
             .map_err(|_| anyhow!("KCL module cache poisoned"))?
             .ast_cache
             .len();
+        opts.detach_cached_modules = true;
         let loaded = match load_program(sess, paths, Some(opts), Some(state.modules.clone())) {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -94,72 +90,42 @@ impl ProgramCache {
             module_count = loaded.program.modules.len(),
             "deployment timing"
         );
-        tracing::info_span!("deployment.kcl.clone_program").in_scope(|| {
-            let started = Instant::now();
-            let result = detach(loaded.program);
-            tracing::info!(
-                stage = "kcl_clone_program",
-                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-                success = result.is_ok(),
-                "deployment timing"
-            );
-            result
-        })
+        Ok(loaded.program)
     }
-}
-
-fn detach(program: Program) -> Result<Program> {
-    let mut cloned = HashMap::new();
-    let mut clone_modules = |modules: HashMap<String, Arc<RwLock<Module>>>| {
-        modules
-            .into_iter()
-            .map(|(path, module)| {
-                let key = Arc::as_ptr(&module);
-                let detached = match cloned.get(&key) {
-                    Some(module) => Arc::clone(module),
-                    None => {
-                        let copy = module
-                            .read()
-                            .map_err(|_| anyhow!("KCL module poisoned"))?
-                            .clone();
-                        let copy = Arc::new(RwLock::new(copy));
-                        cloned.insert(key, Arc::clone(&copy));
-                        copy
-                    }
-                };
-                Ok((path, detached))
-            })
-            .collect::<Result<HashMap<_, _>>>()
-    };
-    Ok(Program {
-        root: program.root,
-        pkgs: program.pkgs,
-        pkgs_not_imported: program.pkgs_not_imported,
-        modules: clone_modules(program.modules)?,
-        modules_not_imported: clone_modules(program.modules_not_imported)?,
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
-    fn detaches_both_maps_and_preserves_internal_aliases() {
-        let module = Arc::new(RwLock::new(Module {
-            filename: "main.k".to_string(),
-            ..Default::default()
-        }));
-        let program = Program {
-            modules: HashMap::from([("main.k".to_string(), module.clone())]),
-            modules_not_imported: HashMap::from([("alias.k".to_string(), module.clone())]),
-            ..Default::default()
-        };
-        let copy = detach(program).unwrap();
-        let main = &copy.modules["main.k"];
-        assert!(!Arc::ptr_eq(main, &module));
-        assert!(Arc::ptr_eq(main, &copy.modules_not_imported["alias.k"]));
-        main.write().unwrap().filename = "changed.k".to_string();
-        assert_eq!(module.read().unwrap().filename, "main.k");
+    fn cached_modules_are_detached_before_import_normalization_and_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("kcl.mod"), "").unwrap();
+        std::fs::create_dir(dir.path().join("pkg")).unwrap();
+        std::fs::write(dir.path().join("pkg/value.k"), "value = 1\n").unwrap();
+        let main = dir.path().join("main.k");
+        std::fs::write(&main, "import pkg\nresult = pkg.value\n").unwrap();
+        let cache = ProgramCache::default();
+        let program = cache
+            .load(
+                Default::default(),
+                &[main.to_str().unwrap()],
+                LoadProgramOptions {
+                    work_dir: dir.path().display().to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let state = cache.state.lock().unwrap();
+        let modules = state.modules.read().unwrap();
+        for (name, module) in &program.modules {
+            let original = &modules.ast_cache[&PathBuf::from(name)];
+            assert!(!Arc::ptr_eq(original, module));
+            let pristine = original.read().unwrap().clone();
+            module.write().unwrap().body.clear();
+            assert_eq!(*original.read().unwrap(), pristine);
+        }
     }
 }

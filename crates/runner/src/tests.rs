@@ -842,3 +842,25 @@ fn test_cache_keeps_imported_semantic_diagnostics_on_reuse() {
         assert_eq!(error, baseline);
     }
 }
+
+#[test]
+fn test_cache_reuses_raw_modules_across_entry_and_import_contexts() {
+    let dir = cache_fixture();
+    let main = dir.path().join("main.k");
+    let shared = dir.path().join("shared.k");
+    fs::write(
+        &shared,
+        "import pkg\nresult = pkg.Record {value = option(\"input\")}\n",
+    )
+    .unwrap();
+    fs::write(&main, "import shared\nresult = shared.result\n").unwrap();
+    let cache = crate::ProgramCache::default();
+    for path in [&shared, &main, &shared, &main] {
+        let mut args = cache_args(dir.path(), 4);
+        args.k_filename_list = vec![path.display().to_string()];
+        let baseline = exec_program(Default::default(), &args).unwrap();
+        let cached = crate::exec_program_with_cache(Default::default(), &args, &cache).unwrap();
+        assert_eq!(cached.err_message, baseline.err_message);
+        assert_eq!(cached.json_result, baseline.json_result);
+    }
+}

@@ -270,6 +270,8 @@ pub struct LoadProgramOptions {
     /// This is important for LSP and other tools that need to maintain
     /// the original file paths as provided by the user/editor.
     pub preserve_symlink_paths: bool,
+    /// Detach raw cached modules before entry-specific import normalization.
+    pub detach_cached_modules: bool,
 }
 
 impl Default for LoadProgramOptions {
@@ -283,6 +285,7 @@ impl Default for LoadProgramOptions {
             load_packages: true,
             load_plugins: false,
             preserve_symlink_paths: false,
+            detach_cached_modules: false,
         }
     }
 }
@@ -1251,6 +1254,7 @@ pub fn parse_program(
     };
 
     let mut modules: HashMap<String, Arc<RwLock<Module>>> = HashMap::new();
+    let mut clone_time = std::time::Duration::ZERO;
     for file in files.iter() {
         let filename = file.get_path().to_str().unwrap().to_string();
         let m_ref = match module_cache.read() {
@@ -1263,7 +1267,19 @@ pub fn parse_program(
                 })?,
             Err(e) => return Err(anyhow::anyhow!("Parse program failed: {e}")),
         };
-        if new_files.contains(file) {
+        let m_ref = if opts.detach_cached_modules {
+            let started = std::time::Instant::now();
+            let copy = m_ref
+                .read()
+                .map_err(|_| anyhow::anyhow!("KCL cached module poisoned"))?
+                .clone();
+            let copy = Arc::new(RwLock::new(copy));
+            clone_time += started.elapsed();
+            copy
+        } else {
+            m_ref
+        };
+        if opts.detach_cached_modules || new_files.contains(file) {
             let pkg = pkgmap
                 .get(file)
                 .ok_or_else(|| anyhow::anyhow!("file not in pkgmap: {:?}", file))?;
@@ -1287,6 +1303,14 @@ pub fn parse_program(
                 pkgs.insert(file.pkg_path.clone(), vec![filename]);
             }
         }
+    }
+    if opts.detach_cached_modules {
+        tracing::info!(
+            stage = "kcl_clone_program",
+            elapsed_ms = clone_time.as_secs_f64() * 1000.0,
+            module_count = modules.len(),
+            "deployment timing"
+        );
     }
     let program = ast::Program {
         root: workdir,
