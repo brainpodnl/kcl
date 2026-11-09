@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
+    time::Instant,
 };
 
 use anyhow::{Result, bail};
@@ -78,19 +79,45 @@ pub fn exec_program(sess: ParseSessionRef, args: &ExecProgramArgs) -> Result<Exe
         .map(|s| s.as_str())
         .collect::<Vec<&str>>();
     let module_cache = KCLModuleCache::default();
-    let mut program = load_program(
-        sess.clone(),
-        kcl_paths_str.as_slice(),
-        Some(opts),
-        Some(module_cache),
-    )?
-    .program;
-    apply_overrides(
-        &mut program,
-        &args.overrides,
-        &[],
-        args.print_override_ast || args.debug > 0,
-    )?;
+    let loaded = tracing::info_span!("deployment.kcl.load_program").in_scope(|| {
+        let started = Instant::now();
+        let result = load_program(
+            sess.clone(),
+            kcl_paths_str.as_slice(),
+            Some(opts),
+            Some(module_cache),
+        );
+        tracing::info!(
+            stage = "kcl_load_program",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            success = result.is_ok(),
+            "deployment timing"
+        );
+        result
+    })?;
+    let mut program = loaded.program;
+    tracing::info!(
+        stage = "kcl_program_size",
+        module_count = program.modules.len(),
+        package_count = program.pkgs.len(),
+        "deployment timing"
+    );
+    tracing::info_span!("deployment.kcl.apply_overrides").in_scope(|| {
+        let started = Instant::now();
+        let result = apply_overrides(
+            &mut program,
+            &args.overrides,
+            &[],
+            args.print_override_ast || args.debug > 0,
+        );
+        tracing::info!(
+            stage = "kcl_apply_overrides",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            success = result.is_ok(),
+            "deployment timing"
+        );
+        result
+    })?;
     execute(sess, program, args)
 }
 
@@ -156,12 +183,33 @@ pub fn execute(
             ..Default::default()
         };
         // Resolve ast
-        let scope = resolve_program_with_opts(&mut program, resolve_opts, None)?;
+        let scope = tracing::info_span!("deployment.kcl.resolve").in_scope(|| {
+            let started = Instant::now();
+            let result = resolve_program_with_opts(&mut program, resolve_opts, None);
+            tracing::info!(
+                stage = "kcl_resolve",
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                success = result.is_ok(),
+                "deployment timing"
+            );
+            result
+        })?;
         emit_compile_diag_to_string(sess, &scope, args.compile_only)?;
         return Ok(ExecProgramResult::default());
     }
     // Resolve ast
-    let mut scope = resolve_program(&mut program)?;
+    let mut scope = tracing::info_span!("deployment.kcl.resolve").in_scope(|| {
+        let started = Instant::now();
+        let result = resolve_program(&mut program);
+        tracing::info!(
+            stage = "kcl_resolve",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            success = result.is_ok(),
+            "deployment timing"
+        );
+        result
+    })?;
+    let diagnostics_started = Instant::now();
     // Build the set of user packages actually referenced from the
     // entry-point program so that the evaluator can skip pass-3 for
     // unused imports (issue #1758). Compute this *before* emitting
@@ -171,13 +219,31 @@ pub fn execute(
     let referenced_pkgs = collect_referenced_pkgs(&scope);
     suppress_unreferenced_pkg_diags(&mut scope, &program, &referenced_pkgs);
     // Emit parse and resolve errors if exists.
-    emit_compile_diag_to_string(sess, &scope, false)?;
+    let diagnostics = emit_compile_diag_to_string(sess, &scope, false);
+    tracing::info!(
+        stage = "kcl_diagnostics",
+        elapsed_ms = diagnostics_started.elapsed().as_secs_f64() * 1000.0,
+        success = diagnostics.is_ok(),
+        "deployment timing"
+    );
+    diagnostics?;
     let referenced_pkgs = Some(referenced_pkgs);
-    FastRunner::new(Some(RunnerOptions {
+    let result = FastRunner::new(Some(RunnerOptions {
         plugin_agent_ptr: args.plugin_agent,
         referenced_pkgs,
     }))
-    .run(&program, args)
+    .run(&program, args);
+    tracing::info_span!("deployment.kcl.drop_program").in_scope(|| {
+        let started = Instant::now();
+        drop(scope);
+        drop(program);
+        tracing::info!(
+            stage = "kcl_drop_program",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "deployment timing"
+        );
+    });
+    result
 }
 
 /// Drop diagnostics from packages that the entry point never

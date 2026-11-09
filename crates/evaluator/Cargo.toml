@@ -6,6 +6,7 @@ edition.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+tracing = "0.1"
 anyhow = "1.0"
 generational-arena = "0.2.9"
 kcl-ast = { path = "../ast" }

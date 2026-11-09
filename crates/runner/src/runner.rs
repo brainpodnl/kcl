@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
+    time::Instant,
 };
 
 use kcl_ast::ast;
@@ -368,6 +369,7 @@ impl FastRunner {
 
     /// Run kcl library with exec arguments.
     pub fn run(&self, program: &ast::Program, args: &ExecProgramArgs) -> Result<ExecProgramResult> {
+        let initialization_started = Instant::now();
         let ctx = Rc::new(RefCell::new(args_to_ctx(program, args)));
         // Coverage state is created up front so it can outlive the
         // `catch_unwind` closure — the closure moves the evaluator by value,
@@ -384,8 +386,14 @@ impl FastRunner {
         if let Some(pkgs) = self.opts.referenced_pkgs_set() {
             evaluator.set_referenced_pkgs(pkgs);
         }
+        tracing::info!(
+            stage = "kcl_initialize",
+            elapsed_ms = initialization_started.elapsed().as_secs_f64() * 1000.0,
+            "deployment timing"
+        );
         // Drop panics recorded on this thread before this run.
         KCL_RUNTIME_PANIC_RECORD.take();
+        let evaluation_started = Instant::now();
         let evaluator_result = catch_unwind_silent(|| {
             if self.opts.plugin_agent_ptr > 0 {
                 #[cfg(not(target_arch = "wasm32"))]
@@ -400,6 +408,13 @@ impl FastRunner {
             }
             evaluator.run()
         });
+        tracing::info!(
+            stage = "kcl_evaluate_and_plan",
+            elapsed_ms = evaluation_started.elapsed().as_secs_f64() * 1000.0,
+            success = evaluator_result.as_ref().is_ok_and(|result| result.is_ok()),
+            "deployment timing"
+        );
+        let result_started = Instant::now();
         KCL_RUNTIME_PANIC_RECORD.with(|record| {
             let record = record.borrow();
             ctx.borrow_mut().set_panic_info(&record);
@@ -464,9 +479,23 @@ impl FastRunner {
                 Err(err) => err.to_string(),
             };
         }
+        tracing::info!(
+            stage = "kcl_result",
+            elapsed_ms = result_started.elapsed().as_secs_f64() * 1000.0,
+            success = result.err_message.is_empty(),
+            "deployment timing"
+        );
         // Free all value references at runtime. This is because the runtime context marks
         // all KCL objects and holds their copies, so it is necessary to actively GC them.
-        ctx.borrow().gc();
+        tracing::info_span!("deployment.kcl.gc").in_scope(|| {
+            let started = Instant::now();
+            ctx.borrow().gc();
+            tracing::info!(
+                stage = "kcl_gc",
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "deployment timing"
+            );
+        });
         // Drain collected coverage hits into the result. We snapshot the
         // recorded `(filename, line, hits)` triples, group by filename, and
         // merge counts so multiple test runs that share a file sum

@@ -567,3 +567,114 @@ fn test_eval_error_keeps_message_after_hook_replaced() {
         "items must be empty"
     );
 }
+
+#[derive(Clone, Default)]
+struct TimingWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for TimingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn traced_exec(code: &str, compile_only: bool) -> (Result<crate::ExecProgramResult>, Vec<Value>) {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("timing.k");
+    fs::write(&file, code).unwrap();
+    let args = ExecProgramArgs {
+        k_filename_list: vec![file.display().to_string()],
+        compile_only,
+        ..Default::default()
+    };
+    let writer = TimingWriter::default();
+    let output = writer.0.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let result = tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!("deployment.render", revision_id = "timing-revision");
+        let _entered = span.enter();
+        exec_program(Arc::new(ParseSession::default()), &args)
+    });
+    let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(!logs.contains("timing-payload-must-not-appear"));
+    let events = logs
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    (result, events)
+}
+
+#[test]
+fn test_phase_timings_preserve_output_and_revision_correlation() {
+    let (result, events) = traced_exec("result = \"timing-payload-must-not-appear\"", false);
+    assert_eq!(
+        serde_json::from_str::<Value>(&result.unwrap().json_result).unwrap(),
+        serde_json::json!({"result": "timing-payload-must-not-appear"})
+    );
+    for stage in [
+        "kcl_load_program",
+        "kcl_apply_overrides",
+        "kcl_resolve",
+        "kcl_diagnostics",
+        "kcl_initialize",
+        "kcl_evaluate",
+        "kcl_plan_output",
+        "kcl_evaluate_and_plan",
+        "kcl_result",
+        "kcl_gc",
+        "kcl_drop_program",
+    ] {
+        let event = events
+            .iter()
+            .find(|event| event["fields"]["stage"] == stage)
+            .unwrap_or_else(|| panic!("missing timing: {stage}"));
+        assert!(event["fields"]["elapsed_ms"].as_f64().unwrap() >= 0.0);
+        assert!(
+            event["spans"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|span| { span["revision_id"] == "timing-revision" })
+        );
+    }
+}
+
+#[test]
+fn test_phase_timings_report_evaluation_failure_without_source() {
+    let (result, events) = traced_exec("assert False, \"timing-payload-must-not-appear\"", false);
+    assert!(!result.unwrap().err_message.is_empty());
+    let event = events
+        .iter()
+        .find(|event| event["fields"]["stage"] == "kcl_evaluate_and_plan")
+        .unwrap();
+    assert_eq!(event["fields"]["success"], false);
+    assert!(
+        events
+            .iter()
+            .any(|event| event["fields"]["stage"] == "kcl_gc")
+    );
+}
+
+#[test]
+fn test_phase_timings_compile_only_does_not_evaluate() {
+    let (result, events) = traced_exec("result = 1", true);
+    assert!(result.unwrap().err_message.is_empty());
+    assert!(
+        events
+            .iter()
+            .any(|event| event["fields"]["stage"] == "kcl_resolve")
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["fields"]["stage"] == "kcl_evaluate")
+    );
+}

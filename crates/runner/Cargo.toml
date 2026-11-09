@@ -9,6 +9,7 @@ edition.workspace = true
 cc = "1.0"
 
 [dependencies]
+tracing = "0.1"
 serde_json = "1.0"
 serde = { version = "1", features = ["derive"] }
 glob = "0.3.0"
@@ -39,6 +40,7 @@ kcl-evaluator.workspace = true
 kcl-primitives.workspace = true
 
 [dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["json"] }
 kcl-parser = { path = "../parser" }
 criterion = "0.5"
 

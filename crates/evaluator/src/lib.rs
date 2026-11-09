@@ -41,6 +41,7 @@ use std::collections::{HashMap, HashSet};
 use std::panic::RefUnwindSafe;
 use std::rc::Rc;
 use std::str;
+use std::time::Instant;
 use std::{cell::RefCell, panic::UnwindSafe};
 
 use crate::error as eval_error;
@@ -232,9 +233,17 @@ impl<'ctx> Evaluator<'ctx> {
 
     /// Evaluate the program and return the JSON and YAML result.
     pub fn run(self: &Evaluator<'ctx>) -> Result<(String, String)> {
-        let modules = self.program.get_modules_for_pkg(kcl_ast::MAIN_PKG);
-        self.init_scope(kcl_ast::MAIN_PKG);
-        self.compile_ast_modules(&modules);
+        tracing::info_span!("deployment.kcl.evaluate").in_scope(|| {
+            let started = Instant::now();
+            let modules = self.program.get_modules_for_pkg(kcl_ast::MAIN_PKG);
+            self.init_scope(kcl_ast::MAIN_PKG);
+            self.compile_ast_modules(&modules);
+            tracing::info!(
+                stage = "kcl_evaluate",
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "deployment timing"
+            );
+        });
         // On wasm32, runtime errors from check/assert blocks are recorded
         // into the context instead of panicking (panic=abort would trap the
         // whole WASI instance); bail out with the recorded error here.
@@ -242,7 +251,18 @@ impl<'ctx> Evaluator<'ctx> {
         if let Some(info) = self.runtime_ctx.borrow().get_panic_info_json_string() {
             return Err(anyhow::anyhow!(info));
         }
-        Ok(self.plan_globals_to_string())
+        Ok(
+            tracing::info_span!("deployment.kcl.plan_output").in_scope(|| {
+                let started = Instant::now();
+                let output = self.plan_globals_to_string();
+                tracing::info!(
+                    stage = "kcl_plan_output",
+                    elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                    "deployment timing"
+                );
+                output
+            }),
+        )
     }
 
     /// Build the Source Map v3 for a planned YAML string produced by

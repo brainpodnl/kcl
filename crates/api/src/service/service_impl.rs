@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::string::String;
+use std::time::Instant;
 
 use crate::gpyrpc::{self, *};
 
@@ -885,8 +886,14 @@ impl KclServiceImpl {
     /// ```
     pub fn exec_program(&self, args: &ExecProgramArgs) -> anyhow::Result<ExecProgramResult> {
         // transform args to json
+        let started = Instant::now();
         let exec_args = transform_exec_para(&Some(args.clone()), self.plugin_agent)?;
         let error_format = resolve_error_format(&args.error_format)?;
+        tracing::info!(
+            stage = "kcl_prepare_args",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "deployment timing"
+        );
         let sess = ParseSessionRef::default();
         let result = exec_program(sess, &exec_args)?;
 
@@ -906,7 +913,13 @@ impl KclServiceImpl {
         // macOS / Windows have no portable reclaim primitive; the
         // recommended fix on those platforms is to preload mimalloc with
         // `MIMALLOC_RESET=1` (see `docs/dev_guide/6.memory_tuning.md`).
+        let started = Instant::now();
         release_memory();
+        tracing::info!(
+            stage = "kcl_release_memory",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "deployment timing"
+        );
 
         Ok(ExecProgramResult {
             json_result: result.json_result,
