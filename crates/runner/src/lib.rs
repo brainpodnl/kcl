@@ -20,6 +20,8 @@ use kcl_sema::resolver::{
 pub use runner::{ExecProgramArgs, ExecProgramResult, MapErrorResult};
 use runner::{FastRunner, RunnerOptions};
 
+mod cache;
+pub use cache::ProgramCache;
 pub mod runner;
 
 #[cfg(test)]
@@ -71,22 +73,43 @@ pub mod tests;
 /// let result = exec_program(sess, &args).unwrap();
 /// ```
 pub fn exec_program(sess: ParseSessionRef, args: &ExecProgramArgs) -> Result<ExecProgramResult> {
-    // parse args from json string
+    exec_program_impl(sess, args, None)
+}
+
+pub fn exec_program_with_cache(
+    sess: ParseSessionRef,
+    args: &ExecProgramArgs,
+    cache: &ProgramCache,
+) -> Result<ExecProgramResult> {
+    if args.plugin_agent != 0 || args.print_override_ast || args.debug > 0 {
+        bail!("cached rendering does not support native plugins or source rewriting");
+    }
+    exec_program_impl(sess, args, args.k_code_list.is_empty().then_some(cache))
+}
+
+fn exec_program_impl(
+    sess: ParseSessionRef,
+    args: &ExecProgramArgs,
+    cache: Option<&ProgramCache>,
+) -> Result<ExecProgramResult> {
     let opts = args.get_load_program_options();
     let kcl_paths_str = args
         .k_filename_list
         .iter()
         .map(|s| s.as_str())
         .collect::<Vec<&str>>();
-    let module_cache = KCLModuleCache::default();
-    let loaded = tracing::info_span!("deployment.kcl.load_program").in_scope(|| {
+    let mut program = tracing::info_span!("deployment.kcl.load_program").in_scope(|| {
         let started = Instant::now();
-        let result = load_program(
-            sess.clone(),
-            kcl_paths_str.as_slice(),
-            Some(opts),
-            Some(module_cache),
-        );
+        let result = match cache {
+            Some(cache) => cache.load(sess.clone(), &kcl_paths_str, opts),
+            None => load_program(
+                sess.clone(),
+                &kcl_paths_str,
+                Some(opts),
+                Some(KCLModuleCache::default()),
+            )
+            .map(|loaded| loaded.program),
+        };
         tracing::info!(
             stage = "kcl_load_program",
             elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
@@ -95,7 +118,6 @@ pub fn exec_program(sess: ParseSessionRef, args: &ExecProgramArgs) -> Result<Exe
         );
         result
     })?;
-    let mut program = loaded.program;
     tracing::info!(
         stage = "kcl_program_size",
         module_count = program.modules.len(),

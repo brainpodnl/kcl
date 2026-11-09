@@ -25,7 +25,7 @@ use kcl_query::override_file;
 use kcl_query::query::CompilationOptions;
 use kcl_query::query::get_full_schema_type;
 use kcl_query::selector::{ListOptions, list_variables};
-use kcl_runner::exec_program;
+use kcl_runner::{ProgramCache, exec_program, exec_program_with_cache};
 use kcl_sema::core::global_state::GlobalState;
 use kcl_sema::resolver::Options;
 use kcl_sema::resolver::scope::KCLScopeCache;
@@ -885,7 +885,22 @@ impl KclServiceImpl {
     /// assert!(error.to_string().contains("No input KCL files or paths"), "{error}");
     /// ```
     pub fn exec_program(&self, args: &ExecProgramArgs) -> anyhow::Result<ExecProgramResult> {
-        // transform args to json
+        self.exec_program_impl(args, None)
+    }
+
+    pub fn exec_program_with_cache(
+        &self,
+        args: &ExecProgramArgs,
+        cache: &ProgramCache,
+    ) -> anyhow::Result<ExecProgramResult> {
+        self.exec_program_impl(args, Some(cache))
+    }
+
+    fn exec_program_impl(
+        &self,
+        args: &ExecProgramArgs,
+        cache: Option<&ProgramCache>,
+    ) -> anyhow::Result<ExecProgramResult> {
         let started = Instant::now();
         let exec_args = transform_exec_para(&Some(args.clone()), self.plugin_agent)?;
         let error_format = resolve_error_format(&args.error_format)?;
@@ -895,7 +910,10 @@ impl KclServiceImpl {
             "deployment timing"
         );
         let sess = ParseSessionRef::default();
-        let result = exec_program(sess, &exec_args)?;
+        let result = match cache {
+            Some(cache) => exec_program_with_cache(sess, &exec_args, cache),
+            None => exec_program(sess, &exec_args),
+        }?;
 
         // If the caller asked for a machine-readable format and the run
         // produced an error message, mirror it to stderr in that format so

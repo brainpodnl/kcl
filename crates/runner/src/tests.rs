@@ -678,3 +678,167 @@ fn test_phase_timings_compile_only_does_not_evaluate() {
             .any(|event| event["fields"]["stage"] == "kcl_evaluate")
     );
 }
+
+fn cache_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("kcl.mod"), "").unwrap();
+    fs::create_dir(dir.path().join("pkg")).unwrap();
+    fs::write(
+        dir.path().join("pkg/model.k"),
+        "schema Record:\n    value: int\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("main.k"), "import pkg\nvalue = option(\"input\")\nassert value >= 0, \"negative ${value}\"\nresult = pkg.Record {value = value}\n").unwrap();
+    dir
+}
+
+fn cache_args(root: &Path, value: i32) -> ExecProgramArgs {
+    ExecProgramArgs {
+        work_dir: Some(root.display().to_string()),
+        k_filename_list: vec![root.join("main.k").display().to_string()],
+        args: vec![kcl_ast::ast::Argument {
+            name: "input".to_string(),
+            value: value.to_string(),
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_cache_isolates_inputs_overrides_and_output_formats() {
+    let dir = cache_fixture();
+    let cache = crate::ProgramCache::default();
+    for value in 0..6 {
+        let mut args = cache_args(dir.path(), value);
+        if value == 2 {
+            args.overrides = vec!["result.value=42".to_string()];
+        }
+        if value == 4 {
+            args.format = Some("json".to_string());
+        }
+        let baseline = exec_program(Default::default(), &args).unwrap();
+        let cached = crate::exec_program_with_cache(Default::default(), &args, &cache).unwrap();
+        assert_eq!(cached.err_message, baseline.err_message);
+        assert_eq!(cached.json_result, baseline.json_result);
+        assert_eq!(cached.yaml_result, baseline.yaml_result);
+    }
+}
+
+#[test]
+fn test_cache_preserves_repeated_import_errors_and_explicit_invalidation() {
+    let dir = cache_fixture();
+    let cache = crate::ProgramCache::default();
+    let args = cache_args(dir.path(), 1);
+    fs::write(
+        dir.path().join("pkg/model.k"),
+        "schema Record\n    value = (\n",
+    )
+    .unwrap();
+    for _ in 0..2 {
+        assert!(crate::exec_program_with_cache(Default::default(), &args, &cache).is_err());
+    }
+    fs::write(
+        dir.path().join("pkg/model.k"),
+        "schema Record:\n    value: int\n",
+    )
+    .unwrap();
+    cache.clear().unwrap();
+    assert!(
+        crate::exec_program_with_cache(Default::default(), &args, &cache)
+            .unwrap()
+            .err_message
+            .is_empty()
+    );
+    fs::write(
+        dir.path().join("pkg/model.k"),
+        "schema Record:\n    value: int\n    generation: int = 2\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("pkg/extra.k"), "additional = True\n").unwrap();
+    cache.clear().unwrap();
+    let cached = crate::exec_program_with_cache(Default::default(), &args, &cache).unwrap();
+    let baseline = exec_program(Default::default(), &args).unwrap();
+    assert_eq!(cached.json_result, baseline.json_result);
+    assert!(cached.json_result.contains("generation"));
+}
+
+#[test]
+fn test_cache_concurrent_reused_workers_keep_distinct_values_and_errors() {
+    let dir = cache_fixture();
+    let cache = Arc::new(crate::ProgramCache::default());
+    std::thread::scope(|scope| {
+        for worker in 0..2 {
+            let cache = cache.clone();
+            let root = dir.path();
+            scope.spawn(move || {
+                for iteration in 0..20 {
+                    let value = 1000 * (worker + 1) + iteration;
+                    let args = cache_args(root, if iteration % 3 == 0 { -value } else { value });
+                    let result =
+                        crate::exec_program_with_cache(Default::default(), &args, &cache).unwrap();
+                    if iteration % 3 == 0 {
+                        assert!(
+                            result.err_message.contains(&format!("negative -{value}")),
+                            "{}",
+                            result.err_message
+                        );
+                    } else {
+                        assert!(result.err_message.is_empty(), "{}", result.err_message);
+                        let output: Value = serde_json::from_str(&result.json_result).unwrap();
+                        assert_eq!(output["result"]["value"], value);
+                    }
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn test_cache_changes_source_namespace_and_rejects_side_effect_modes() {
+    let first = cache_fixture();
+    let second = cache_fixture();
+    fs::write(
+        second.path().join("pkg/model.k"),
+        "schema Record:\n    value: int\n    second: bool = True\n",
+    )
+    .unwrap();
+    let cache = crate::ProgramCache::default();
+    for root in [first.path(), second.path(), first.path()] {
+        let args = cache_args(root, 1);
+        let cached = crate::exec_program_with_cache(Default::default(), &args, &cache).unwrap();
+        assert_eq!(
+            cached.json_result,
+            exec_program(Default::default(), &args).unwrap().json_result
+        );
+    }
+    for field in 0..3 {
+        let mut args = cache_args(first.path(), 1);
+        match field {
+            0 => args.plugin_agent = 1,
+            1 => args.print_override_ast = true,
+            _ => args.debug = 1,
+        }
+        assert!(crate::exec_program_with_cache(Default::default(), &args, &cache).is_err());
+    }
+}
+
+#[test]
+fn test_cache_keeps_imported_semantic_diagnostics_on_reuse() {
+    let dir = cache_fixture();
+    fs::write(
+        dir.path().join("pkg/model.k"),
+        "schema Record:\n    value: UndefinedType\n",
+    )
+    .unwrap();
+    let args = cache_args(dir.path(), 1);
+    let cache = crate::ProgramCache::default();
+    let baseline = exec_program(Default::default(), &args)
+        .unwrap_err()
+        .to_string();
+    for _ in 0..2 {
+        let error = crate::exec_program_with_cache(Default::default(), &args, &cache)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, baseline);
+    }
+}

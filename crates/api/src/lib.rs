@@ -37,6 +37,7 @@ pub use crate::gpyrpc::*;
 use crate::service::capi::{kcl_service_call_with_length, kcl_service_new};
 use crate::service::service_impl::KclServiceImpl;
 use anyhow::Result;
+pub use kcl_runner::ProgramCache;
 use std::ffi::{CString, c_char};
 
 pub type API = KclServiceImpl;
